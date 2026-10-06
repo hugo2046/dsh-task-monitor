@@ -15,6 +15,7 @@ CLAUDE.local.md
 /Users*.dsh*
 
 # 本地私人文档：只留在本机供 AI 协作使用，不进公开仓库
+/notes/
 /AGENTS.md
 /CLAUDE.md
 /新项目启动指令（记忆增强版）.md
