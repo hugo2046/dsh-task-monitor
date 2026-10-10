@@ -22,6 +22,9 @@ CLAUDE.local.md
 /taskmonitor-自检.md
 /taskmonitor自检.docx
 
+# Qoder 自动生成的 Repo Wiki 文档：本机留着看，不进公开仓库
+/.qoder/
+
 开源发布/
 *.7z
 *.zip
