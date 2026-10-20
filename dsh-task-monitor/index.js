@@ -842,10 +842,23 @@ function classifyEvents(events, workspace) {
   const failed = new Set()
   for (const event of events ?? []) {
     if (!event || typeof event !== 'object') continue
-    if (event.type === 'tool/call') {
+    if (event.type === 'tool/call' || event.type === 'tool/ptc-dispatch-start') {
       const data = event.data ?? {}
-      if (typeof data.callId === 'string' || typeof data.callId === 'number') {
-        calls.set(String(data.callId), data)
+      const callId = data.callId ?? data.subCallId ?? data.parentCallId
+      if (typeof callId === 'string' || typeof callId === 'number') {
+        calls.set(String(callId), data)
+      }
+      continue
+    }
+    // 工具在 run_code 里经 PTC 调用（mcp__* / skill / write / web_* 都走这里），
+    // 只认 tool/call 会漏掉整个 PTC 调用链，所以同时解析 ptc-dispatch 事件。
+    if (event.type === 'tool/ptc-dispatch') {
+      const data = event.data ?? {}
+      const callId = data.subCallId ?? data.parentCallId
+      if (typeof callId === 'string' || typeof callId === 'number') {
+        const key = String(callId)
+        if (!calls.has(key)) calls.set(key, { name: data.name, arguments: data.arguments })
+        if (data.isError === true) failed.add(key)
       }
       continue
     }
