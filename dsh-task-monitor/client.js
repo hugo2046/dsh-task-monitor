@@ -104,6 +104,8 @@ window.__ModuleLoader__.load({
       'commit.sync.remoteMissing': '远端仓库已不存在（可能在 GitHub 上被删除），这里的同步状态是本地旧记录，不算数',
       'commit.sync.noUpstream': '远端还没有这个分支',
       'commit.switchDone': '已切换到 {branch}',
+      'environment.branchInUseTag': '（已在其它工作区检出）',
+      'environment.branchInUse': '分支 {branch} 已在另一个工作区检出：{path}。同一个分支不能同时检出两次——请先在那里切到别的分支，或移除那个工作区后再切换。',
       'commit.needPublish': '还没有远端仓库，请先发布到 GitHub',
       'commit.loading': '正在读取仓库信息…',
       'commit.loadFailed': '读不到仓库信息',
@@ -202,6 +204,8 @@ window.__ModuleLoader__.load({
       'commit.sync.remoteMissing': 'The remote repository no longer exists (probably deleted on GitHub); the sync state shown is stale local info',
       'commit.sync.noUpstream': 'Remote has no such branch yet',
       'commit.switchDone': 'Switched to {branch}',
+      'environment.branchInUseTag': '(checked out in another worktree)',
+      'environment.branchInUse': 'Branch {branch} is already checked out in another worktree: {path}. A branch can only be checked out once — switch away there, or remove that worktree, then try again.',
       'commit.needPublish': 'No remote yet — publish to GitHub first',
       'commit.loading': 'Loading repository…',
       'commit.loadFailed': 'Cannot read the repository',
@@ -1479,7 +1483,11 @@ window.__ModuleLoader__.load({
               },
               env && env.detached
                 ? [h('option', { key: 'detached', value: currentBranch || '' }, t('commit.detached'))]
-                : branches.map((name) => h('option', { key: name, value: name }, name)),
+                : branches.map((name) => {
+                    const occupiedBranches = info.data && info.data.occupied ? info.data.occupied : {}
+                    const path = occupiedBranches[name] ? String(occupiedBranches[name]) : ''
+                    return h('option', { key: name, value: name }, path ? name + ' ' + t('environment.branchInUseTag') : name)
+                  }),
             ),
           ),
         ),
@@ -1562,6 +1570,10 @@ window.__ModuleLoader__.load({
       const [collapsed, setCollapsed] = React.useState(DEFAULT_COLLAPSED)
       const [notice, setNotice] = React.useState(null)
       const [dialogOpen, setDialogOpen] = React.useState(false)
+      const [branches, setBranches] = React.useState([])
+      const [occupied, setOccupied] = React.useState({})
+      const [branchBusy, setBranchBusy] = React.useState(false)
+      const [branchError, setBranchError] = React.useState(null)
 
       const useJobsFn = typeof props.useJobs === 'function' ? props.useJobs : useEmptySelector
       const jobRowsRaw = useJobsFn((jobsState) => (jobsState && jobsState.rows ? jobsState.rows[sessionId] : null))
@@ -1586,6 +1598,54 @@ window.__ModuleLoader__.load({
 
       const data = state.data
       const environment = data && data.environment ? data.environment : null
+      const isRepo = !!(environment && environment.isRepo)
+      React.useEffect(() => {
+        if (!sessionId || !isRepo) {
+          setBranches([])
+          return undefined
+        }
+        let cancelled = false
+        postJson(GIT_INFO_ROUTE, { sessionId, fast: true })
+          .then((body) => {
+            if (cancelled || !body || body.ok !== true || !body.value) return
+            setBranches(Array.isArray(body.value.branches) ? body.value.branches : [])
+            setOccupied(body.value.occupied && typeof body.value.occupied === 'object' ? body.value.occupied : {})
+          })
+          .catch(() => {})
+        return () => {
+          cancelled = true
+        }
+      }, [sessionId, isRepo, environment && environment.branch])
+
+      /** 切不过去时找出「被哪个工作区占着」：宿主新版直接给 worktree 字段，旧版只能从报错文案里取路径。 */
+      const worktreeOf = (info, branchName) => {
+        if (info && typeof info.worktree === 'string' && info.worktree !== '') return info.worktree
+        if (occupied && occupied[branchName]) return String(occupied[branchName])
+        const match = String((info && info.message) || '').match(/worktree at '([^']+)'|checked out at '([^']+)'/i)
+        return match ? match[1] || match[2] : ''
+      }
+
+      const switchBranch = (branch) => {
+        if (!branch || branchBusy || !environment || branch === environment.branch) return
+        setBranchBusy(true)
+        setBranchError(null)
+        postJson(GIT_SWITCH_ROUTE, { sessionId, branch })
+          .then((body) => {
+            if (body && body.ok === true) {
+              setNotice(t('commit.switchDone', { branch }))
+              state.reload()
+              return
+            }
+            const info = (body && body.error) || {}
+            setBranchError({ branch, worktree: worktreeOf(info, branch), message: String(info.message || t('error')) })
+          })
+          .catch((error) => {
+            const message = String((error && error.message) || error)
+            setBranchError({ branch, worktree: worktreeOf({ message }, branch), message })
+          })
+          .finally(() => setBranchBusy(false))
+      }
+
       const skills = (data && data.skills) || []
       const mcp = (data && data.mcp) || []
       const artifacts = (data && data.artifacts) || []
@@ -1681,7 +1741,68 @@ window.__ModuleLoader__.load({
           )
         }
         if (environment.isRepo) {
-          envRows.push(h(Row, { key: 'branch', leading: { icon: IconBranch }, text: environment.branch || '—' }))
+          const branchValue = environment.branch || ''
+          const branchOptions = Array.isArray(branches) ? branches.slice() : []
+          if (branchValue && branchOptions.indexOf(branchValue) === -1) branchOptions.unshift(branchValue)
+          envRows.push(
+            h(Row, {
+              key: 'branch',
+              leading: { icon: IconBranch },
+              title: t('environment.branch'),
+              text: h(
+                'select',
+                {
+                  value: branchValue,
+                  disabled: branchBusy || branches.length === 0,
+                  onChange: (event) => switchBranch(event.target.value),
+                  'aria-label': t('environment.branch'),
+                  style: {
+                    width: '100%',
+                    minWidth: 0,
+                    border: 'none',
+                    outline: 'none',
+                    background: 'transparent',
+                    color: 'inherit',
+                    font: 'inherit',
+                    lineHeight: 'inherit',
+                    padding: 0,
+                    margin: 0,
+                    cursor: branchBusy ? 'wait' : 'pointer',
+                    appearance: 'none',
+                    WebkitAppearance: 'none',
+                  },
+                },
+                (branchValue === '' ? [h('option', { key: '__none', value: '' }, '—')] : []).concat(
+                  branchOptions.map((name) => {
+                    const path = occupied && occupied[name] ? String(occupied[name]) : ''
+                    return h(
+                      'option',
+                      { key: name, value: name, title: path ? t('environment.branchInUse', { branch: name, path }) : undefined },
+                      path ? name + ' ' + t('environment.branchInUseTag') : name,
+                    )
+                  }),
+                ),
+              ),
+              trailing: branchBusy
+                ? h(Spinner, { size: 11 })
+                : h(IconChevron, { style: { transform: 'rotate(90deg)', opacity: 0.55 } }),
+            }),
+          )
+
+          if (branchError) {
+            envRows.push(
+              h(
+                'div',
+                {
+                  key: 'branch-error',
+                  style: { padding: '0 6px', fontSize: 12, lineHeight: '17px', color: C.error, wordBreak: 'break-all' },
+                },
+                branchError.worktree
+                  ? t('environment.branchInUse', { branch: branchError.branch, path: branchError.worktree })
+                  : branchError.message,
+              ),
+            )
+          }
           envRows.push(
             h(Row, {
               key: 'ahead',

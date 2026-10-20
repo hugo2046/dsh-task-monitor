@@ -187,6 +187,8 @@ function friendlyGitError(stderr) {
   if (/non-fast-forward|fetch first|rejected/i.test(text)) return '远端包含本地尚未同步的提交，请先同步后重试。'
   if (/would be overwritten|local changes/i.test(text)) return '当前改动会阻止此操作，请先提交或暂存改动。'
   if (/index\.lock|another git process/i.test(text)) return '仓库正被另一个 Git 进程占用，请稍后重试。'
+  const usedByWorktree = text.match(/is already used by worktree at '([^']+)'/i) || text.match(/already checked out at '([^']+)'/i)
+  if (usedByWorktree) return '这个分支已经在另一个工作区（worktree）里检出：' + usedByWorktree[1] + '。同一个分支不能同时检出两次——请先在那里切到别的分支，或移除那个工作区后再切换。'
   const first = text.split(/\r?\n/).find((line) => line.trim() !== '')
   return first || 'Git 操作未完成，请刷新后重试。'
 }
@@ -364,18 +366,63 @@ async function commitStats(ctx, canonical) {
   return stats
 }
 
+/** 解析 git worktree list --porcelain：每个工作区一段，branch refs/heads/x 说明它占着哪个分支。 */
+function parseWorktreeList(stdout) {
+  const byBranch = {}
+  let currentPath = ''
+  for (const raw of String(stdout || '').split('\n')) {
+    const line = raw.trim()
+    if (line === '') {
+      currentPath = ''
+      continue
+    }
+    if (line.startsWith('worktree ')) {
+      currentPath = line.slice('worktree '.length)
+      continue
+    }
+    if (currentPath !== '' && line.startsWith('branch refs/heads/')) {
+      byBranch[line.slice('branch refs/heads/'.length)] = currentPath
+    }
+  }
+  return byBranch
+}
+
+/**
+ * 被其它工作区占着、当前工作区切不过去的分支（同一个分支不能同时检出两次）。
+ * 返回 { 分支名: 那个工作区的路径 }。
+ */
+async function worktreeOccupancy(ctx, canonical, currentBranch) {
+  const result = await runGitTimed(ctx, ['worktree', 'list', '--porcelain'], canonical)
+  if (result.exitCode !== 0) return {}
+  const byBranch = parseWorktreeList(result.stdout)
+  const occupied = {}
+  for (const [branch, path] of Object.entries(byBranch)) {
+    if (!branch || branch === currentBranch) continue
+    let resolved = path
+    try {
+      resolved = await realpath(path)
+    } catch {
+      // 工作区目录可能已被删掉，按原样比较
+    }
+    if (resolved === canonical) continue
+    occupied[branch] = path
+  }
+  return occupied
+}
+
 async function gitInfo(ctx, canonical, options) {
   const environment = await environmentOf(ctx, canonical)
-  if (!environment.isRepo) return { environment, branches: [], stats: null, github: null, githubChecked: false }
+  if (!environment.isRepo) return { environment, branches: [], occupied: {}, stats: null, github: null, githubChecked: false }
   const stats = await commitStats(ctx, canonical)
   const branchResult = await runGitTimed(ctx, ['branch', '--format=%(refname:short)'], canonical)
   const branches = String(branchResult.stdout || '')
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
+  const occupied = await worktreeOccupancy(ctx, canonical, environment.branch)
   // fast：只给本地信息，GitHub 状态另走一次请求（避免网络慢时对话框迟迟不出来）
-  if (options && options.fast === true) return { environment, branches, stats, github: null, githubChecked: false }
-  return { environment, branches, stats, github: await githubInfo(ctx, canonical), githubChecked: true }
+  if (options && options.fast === true) return { environment, branches, occupied, stats, github: null, githubChecked: false }
+  return { environment, branches, occupied, stats, github: await githubInfo(ctx, canonical), githubChecked: true }
 }
 
 // ── GitHub 登录（插件自管令牌文件，不依赖系统凭据助手）────────────────────────
@@ -744,8 +791,16 @@ async function gitPush(ctx, canonical) {
 
 async function gitSwitch(ctx, canonical, branch) {
   const result = await runGitTimed(ctx, ['switch', '--no-guess', branch], canonical, GIT_WRITE_TIMEOUT_MS)
-  if (result.exitCode !== 0) return { ok: false, error: friendlyGitError(result.stderr) }
-  return { ok: true, branch }
+  if (result.exitCode === 0) return { ok: true, branch }
+  // 分支被别的工作区占着时，把那个路径一并带回去：界面才能说清「为什么切不过去」
+  const stderr = String(result.stderr || '')
+  const used = stderr.match(/is already used by worktree at '([^']+)'/i) || stderr.match(/already checked out at '([^']+)'/i)
+  return {
+    ok: false,
+    code: used ? 'branch-in-use' : 'git-failed',
+    worktree: used ? used[1] : null,
+    error: friendlyGitError(stderr),
+  }
 }
 
 // ── 会话事件归类 ───────────────────────────────────────────────────────────
@@ -1083,7 +1138,9 @@ export function apply(ctx) {
             return
           }
           const result = await gitSwitch(ctx, canonical, branch)
-          writeJson(res, 200, result.ok ? { ok: true, value: { branch: result.branch } } : { ok: false, error: { code: 'git-failed', message: result.error } })
+          writeJson(res, 200, result.ok
+            ? { ok: true, value: { branch: result.branch } }
+            : { ok: false, error: { code: result.code ?? 'git-failed', message: result.error, branch, worktree: result.worktree ?? null } })
           return
         }
         if (pathname === '/taskmonitor/git/github-login-token') {
