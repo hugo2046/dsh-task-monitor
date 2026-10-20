@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-task-monitor",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "private": true,
   "type": "module",
   "description": "DSH 窗口右侧独立「任务监控」浮层：环境信息 / 技能与 MCP / 产出 / 网页查阅（只读）。",
